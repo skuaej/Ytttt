@@ -1,119 +1,170 @@
-import subprocess
-import random
+import os
 import time
-from fastapi import FastAPI, Query, HTTPException
+import psutil
+import asyncio
+import subprocess
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse, RedirectResponse
 
-app = FastAPI()
+app = FastAPI(title="YT Stream API")
 
-COOKIES_FILE = "cookies.txt"
-PROXY_FILE = "proxy.txt"
-TIMEOUT = 90
+START_TIME = time.time()
+
+# ==========================
+# CONFIG
+# ==========================
+YTDLP = "yt-dlp"
+COOKIES = "cookies.txt"
+MAX_VIDEO_QUALITY = "360p"
+
+# ==========================
+# UTILS
+# ==========================
+def uptime():
+    s = int(time.time() - START_TIME)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h}h {m}m {s}s"
 
 
-# -------------------------------
-# Load SOCKS5 proxies only
-# -------------------------------
-def load_socks5_proxies():
+def load_level(cpu):
+    if cpu < 40:
+        return "LOW"
+    elif cpu < 70:
+        return "MEDIUM"
+    return "HIGH"
+
+
+# ==========================
+# HEALTH / PING
+# ==========================
+@app.get("/")
+async def root():
+    return {
+        "status": "running",
+        "uptime": uptime(),
+        "endpoints": ["/audio", "/video", "/status", "/ping"]
+    }
+
+
+@app.get("/ping")
+async def ping():
+    return {"ping": "pong", "uptime": uptime()}
+
+
+# ==========================
+# SERVER STATUS
+# ==========================
+@app.get("/status")
+async def status():
+    cpu = psutil.cpu_percent(interval=0.5)
+    ram = psutil.virtual_memory()
+
+    return {
+        "cpu": {
+            "usage_percent": cpu,
+            "load_level": load_level(cpu)
+        },
+        "ram": {
+            "total_mb": int(ram.total / 1024 / 1024),
+            "used_mb": int(ram.used / 1024 / 1024),
+            "usage_percent": ram.percent
+        },
+        "policy": {
+            "video_allowed": cpu < 80,
+            "max_video_quality": MAX_VIDEO_QUALITY
+        }
+    }
+
+
+# ==========================
+# AUDIO STREAM
+# ==========================
+@app.get("/audio")
+async def audio(url: str = Query(...)):
     try:
-        with open(PROXY_FILE, "r") as f:
-            return [
-                p.strip()
-                for p in f.readlines()
-                if p.strip().startswith("socks5://")
-            ]
-    except FileNotFoundError:
-        return []
-
-
-# -------------------------------
-# yt-dlp runner with auto rotate
-# -------------------------------
-def fetch_audio_url(video_url: str):
-    proxies = load_socks5_proxies()
-    random.shuffle(proxies)
-
-    last_error = None
-
-    # Try with proxy first
-    for proxy in proxies:
-        try:
-            print(f"[TRYING PROXY] {proxy}")
-
-            cmd = [
-                "yt-dlp",
-                "--cookies", COOKIES_FILE,
-                "--remote-components", "ejs:github",
-                "--force-ipv4",
-                "--proxy", proxy,
-                "-f", "bestaudio",
-                "-g",
-                video_url,
-            ]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=TIMEOUT
-            )
-
-            if result.returncode == 0 and result.stdout.strip():
-                print("[SUCCESS WITH PROXY]")
-                return result.stdout.strip()
-
-            last_error = result.stderr
-
-        except Exception as e:
-            last_error = str(e)
-
-    # -------------------------------
-    # Fallback: WITHOUT PROXY
-    # -------------------------------
-    try:
-        print("[FALLBACK] Trying without proxy")
-
         cmd = [
-            "yt-dlp",
-            "--cookies", COOKIES_FILE,
+            YTDLP,
+            "--cookies", COOKIES,
             "--remote-components", "ejs:github",
             "--force-ipv4",
             "-f", "bestaudio",
             "-g",
-            video_url,
+            url,
         ]
 
-        result = subprocess.run(
+        proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=TIMEOUT
+            timeout=20
         )
 
-        if result.returncode == 0 and result.stdout.strip():
-            print("[SUCCESS WITHOUT PROXY]")
-            return result.stdout.strip()
+        stream = proc.stdout.strip()
+        if not stream:
+            return JSONResponse(
+                {"status": "error", "reason": "audio_not_found"},
+                status_code=500
+            )
 
-        last_error = result.stderr
-
-    except Exception as e:
-        last_error = str(e)
-
-    raise Exception(last_error or "yt-dlp failed")
-
-
-# -------------------------------
-# API Endpoint
-# -------------------------------
-@app.get("/audio")
-def get_audio(url: str = Query(...)):
-    try:
-        audio_url = fetch_audio_url(url)
         return {
             "status": "success",
-            "audio": audio_url
+            "audio": stream
         }
+
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
+        return JSONResponse(
+            {"status": "error", "reason": str(e)},
+            status_code=500
+        )
+
+
+# ==========================
+# VIDEO STREAM (360p)
+# ==========================
+@app.get("/video")
+async def video(url: str = Query(...)):
+    cpu = psutil.cpu_percent(interval=0.3)
+
+    if cpu > 80:
+        return JSONResponse(
+            {"status": "blocked", "reason": "high_cpu"},
+            status_code=503
+        )
+
+    try:
+        cmd = [
+            YTDLP,
+            "--cookies", COOKIES,
+            "--remote-components", "ejs:github",
+            "--force-ipv4",
+            "-f", "bv*[height<=360]+ba/b",
+            "-g",
+            url,
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=25
+        )
+
+        stream = proc.stdout.strip()
+        if not stream:
+            return JSONResponse(
+                {"status": "error", "reason": "video_not_found"},
+                status_code=500
             )
+
+        return {
+            "status": "success",
+            "quality": "360p",
+            "video": stream
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "reason": str(e)},
+            status_code=500
+        )
