@@ -2,3 +2,6 @@ fastapi
 uvicorn
 yt-dlp
 anyio
+apt update
+apt install -y ffmpeg
+pip install fastapi uvicorn yt-dlp
