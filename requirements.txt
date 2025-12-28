@@ -1,7 +1,11 @@
 # requirements.txt
-fastapi
-uvicorn
-psutil
+
+
+
 yt-dlp
 yt-dlp-ejs
-redis
+
+fastapi==0.110.0
+uvicorn==0.29.0
+redis==5.0.1
+psutil==5.9.8
