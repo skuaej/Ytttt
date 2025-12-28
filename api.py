@@ -1,31 +1,42 @@
-import subprocess
+import os
 import json
 import time
+import shutil
 import psutil
+import subprocess
 from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
 
-app = FastAPI(title="Ultra-Low-CPU YouTube Streaming API")
+app = FastAPI(title="Ytttt Streaming API")
 
-YTDLP = "yt-dlp"
 START_TIME = time.time()
+YTDLP = "yt-dlp"
+FFMPEG = "ffmpeg"
+COOKIES = "cookies.txt"
+DOWNLOADS = "downloads"
+
+os.makedirs(DOWNLOADS, exist_ok=True)
 
 # -------------------------
 # UTILS
 # -------------------------
-def run(cmd, timeout=30):
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout
-    )
-
 def uptime():
     s = int(time.time() - START_TIME)
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
     return f"{h}h {m}m {s}s"
+
+def run(cmd, timeout=300):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+def stats():
+    disk = shutil.disk_usage("/")
+    return {
+        "uptime": uptime(),
+        "cpu_percent": psutil.cpu_percent(interval=0.5),
+        "ram_percent": psutil.virtual_memory().percent,
+        "disk_free_gb": round(disk.free / 1024**3, 2),
+    }
 
 # -------------------------
 # BASIC
@@ -33,15 +44,19 @@ def uptime():
 @app.get("/")
 def root():
     return {
-        "service": "Ytttt Streaming API",
+        "name": "Ytttt",
+        "status": "running",
         "endpoints": [
-            "/video",
             "/audio",
+            "/audio.m3u8",
+            "/video",
+            "/video.m3u8",
             "/video/qualities",
             "/playlist",
+            "/download",
             "/stats",
-            "/ping"
-        ]
+            "/ping",
+        ],
     }
 
 @app.get("/ping")
@@ -49,97 +64,96 @@ def ping():
     return {"ping": "pong", "uptime": uptime()}
 
 @app.get("/stats")
-def stats():
-    return {
-        "uptime": uptime(),
-        "cpu_percent": psutil.cpu_percent(interval=0.2),
-        "ram_percent": psutil.virtual_memory().percent
-    }
+def server_stats():
+    return stats()
 
 # -------------------------
-# AUDIO (LINK ONLY)
+# AUDIO (BEST FOR TELEGRAM)
 # -------------------------
 @app.get("/audio")
 def audio(url: str = Query(...)):
     cmd = [
         YTDLP,
-        "--no-playlist",
+        "--cookies", COOKIES,
         "-f", "bestaudio",
         "-g",
-        url
+        url,
     ]
-
     p = run(cmd)
     if p.returncode != 0:
         raise HTTPException(500, p.stderr)
-
-    return {
-        "type": "audio",
-        "audio_url": p.stdout.strip()
-    }
+    return {"audio": p.stdout.strip()}
 
 # -------------------------
-# VIDEO STREAMING (NO DOWNLOAD)
+# AUDIO HLS (STREAMING)
+# -------------------------
+@app.get("/audio.m3u8")
+def audio_hls(url: str = Query(...)):
+    cmd = [
+        YTDLP,
+        "--cookies", COOKIES,
+        "-f", "bestaudio",
+        "--hls-use-mpegts",
+        "-g",
+        url,
+    ]
+    p = run(cmd)
+    if p.returncode != 0:
+        raise HTTPException(500, p.stderr)
+    return {"audio_m3u8": p.stdout.strip()}
+
+# -------------------------
+# VIDEO (MERGED → SOUND FIXED)
 # -------------------------
 @app.get("/video")
-def video(
-    url: str = Query(...),
-    quality: str = Query("best")
-):
-    """
-    quality examples:
-    2160p, 1440p, 1080p, 720p
-    """
-
-    if quality == "best":
-        fmt = "best"
-    else:
-        height = quality.replace("p", "")
-        fmt = f"bestvideo[height<={height}]/best"
+def video(url: str = Query(...)):
+    out = os.path.join(DOWNLOADS, f"video_{int(time.time())}.mp4")
 
     cmd = [
         YTDLP,
-        "--no-playlist",
-        "-f", fmt,
-        "-g",
-        url
+        "--cookies", COOKIES,
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "-o", out,
+        url,
     ]
-
     p = run(cmd)
     if p.returncode != 0:
         raise HTTPException(500, p.stderr)
 
-    lines = p.stdout.strip().splitlines()
-
-    # DASH (video + audio)
-    if len(lines) == 2:
-        return {
-            "type": "dash",
-            "quality": quality,
-            "video_url": lines[0],
-            "audio_url": lines[1]
-        }
-
-    # Progressive
-    return {
-        "type": "progressive",
-        "quality": quality,
-        "url": lines[0]
-    }
+    return FileResponse(out, media_type="video/mp4", filename="video.mp4")
 
 # -------------------------
-# VIDEO QUALITIES
+# VIDEO HLS (SABR SAFE)
 # -------------------------
-@app.get("/video/qualities")
-def video_qualities(url: str = Query(...)):
+@app.get("/video.m3u8")
+def video_hls(url: str = Query(...)):
     cmd = [
         YTDLP,
-        "--no-playlist",
-        "--dump-json",
-        url
+        "--cookies", COOKIES,
+        "-f", "bv*+ba/b",
+        "--hls-use-mpegts",
+        "-g",
+        url,
     ]
+    p = run(cmd)
+    if p.returncode != 0:
+        raise HTTPException(500, p.stderr)
 
-    p = run(cmd, timeout=60)
+    return {"video_m3u8": p.stdout.strip()}
+
+# -------------------------
+# ALL VIDEO QUALITIES
+# -------------------------
+@app.get("/video/qualities")
+def qualities(url: str = Query(...)):
+    cmd = [
+        YTDLP,
+        "--cookies", COOKIES,
+        "--dump-json",
+        url,
+    ]
+    p = run(cmd, timeout=120)
     if p.returncode != 0:
         raise HTTPException(500, p.stderr)
 
@@ -147,40 +161,41 @@ def video_qualities(url: str = Query(...)):
     formats = []
 
     for f in info.get("formats", []):
-        if not f.get("height"):
+        if not f.get("url"):
             continue
-
         formats.append({
             "format_id": f.get("format_id"),
+            "ext": f.get("ext"),
             "height": f.get("height"),
             "fps": f.get("fps"),
-            "ext": f.get("ext"),
             "has_audio": f.get("acodec") != "none",
             "protocol": f.get("protocol"),
-            "url": f.get("url")
+            "url": f.get("url"),
         })
 
     return {
         "title": info.get("title"),
         "duration": info.get("duration"),
-        "max_quality": f"{max(f['height'] for f in formats)}p",
-        "formats": formats
+        "formats": formats,
     }
 
 # -------------------------
-# PLAYLIST
+# PLAYLIST SUPPORT
 # -------------------------
 @app.get("/playlist")
 def playlist(url: str = Query(...), limit: int = 50):
+    limit = min(limit, 300)
+
     cmd = [
         YTDLP,
-        "--flat-playlist",
+        "--cookies", COOKIES,
         "--dump-json",
-        "--playlist-end", str(min(limit, 300)),
-        url
+        "--flat-playlist",
+        "--playlist-end", str(limit),
+        url,
     ]
 
-    p = run(cmd, timeout=120)
+    p = run(cmd, timeout=180)
     if p.returncode != 0:
         raise HTTPException(500, p.stderr)
 
@@ -189,10 +204,31 @@ def playlist(url: str = Query(...), limit: int = 50):
         v = json.loads(line)
         videos.append({
             "title": v.get("title"),
-            "url": f"https://youtu.be/{v.get('id')}"
+            "url": f"https://youtu.be/{v.get('id')}",
         })
 
-    return {
-        "count": len(videos),
-        "videos": videos
-    }
+    return {"count": len(videos), "videos": videos}
+
+# -------------------------
+# DOWNLOAD (ANY QUALITY)
+# -------------------------
+@app.get("/download")
+def download(url: str = Query(...), quality: str = "best"):
+    out = os.path.join(DOWNLOADS, f"download_{int(time.time())}.mp4")
+
+    fmt = "bv*+ba/b" if quality == "best" else f"bv*[height<={quality.replace('p','')}] + ba"
+
+    cmd = [
+        YTDLP,
+        "--cookies", COOKIES,
+        "-f", fmt,
+        "--merge-output-format", "mp4",
+        "-o", out,
+        url,
+    ]
+
+    p = run(cmd, timeout=600)
+    if p.returncode != 0:
+        raise HTTPException(500, p.stderr)
+
+    return FileResponse(out, media_type="video/mp4", filename="video.mp4")
