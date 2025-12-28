@@ -1,27 +1,20 @@
-import json
-import time
-import subprocess
 import os
+import json
 import shutil
+import subprocess
+import psutil
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
+from fastapi.responses import RedirectResponse, JSONResponse, FileResponse
 
-app = FastAPI(title="Ytttt Ultra-Fast API", version="2.0")
+app = FastAPI(title="Ytttt API", version="2.0.0")
 
-# -------------------------
-# CONFIG
-# -------------------------
-COOKIES = "cookies.txt"
 DOWNLOAD_DIR = "downloads"
-CACHE_TTL = 300  # 5 minutes
-
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-CACHE = {}
+# --------------------------------------------------
+# CORE UTILS
+# --------------------------------------------------
 
-# -------------------------
-# UTILS
-# -------------------------
 def run(cmd):
     return subprocess.run(
         cmd,
@@ -30,193 +23,239 @@ def run(cmd):
         text=True
     )
 
-def yt_cmd():
+def base_cmd():
     return [
         "yt-dlp",
         "--no-warnings",
-        "--cookies", COOKIES,
-        "--user-agent", "Mozilla/5.0",
-        "--extractor-args", "youtube:player_client=tv,web",
-        "--extractor-args", "youtube:skip=dash",
-        "--no-playlist",
-        "--dump-json"
+        "--no-cache-dir",
+        "--rm-cache-dir",
+        "--cookies", "cookies.txt",
+        "--user-agent", "Mozilla/5.0"
     ]
 
-def get_cache(url):
-    c = CACHE.get(url)
-    if not c:
-        return None
-    if time.time() - c["time"] > CACHE_TTL:
-        del CACHE[url]
-        return None
-    return c["info"]
+# --------------------------------------------------
+# HOME / STATS
+# --------------------------------------------------
 
-def set_cache(url, info):
-    CACHE[url] = {"time": time.time(), "info": info}
-
-def fetch_info(url):
-    cached = get_cache(url)
-    if cached:
-        return cached
-
-    p = run(yt_cmd() + [url])
-    if p.returncode != 0:
-        raise Exception(p.stderr)
-
-    info = json.loads(p.stdout)
-    set_cache(url, info)
-    return info
-
-def pick_quality(formats, wanted_height):
-    formats = sorted(
-        formats,
-        key=lambda f: f.get("height") or 0,
-        reverse=True
-    )
-
-    for f in formats:
-        if f.get("height") == wanted_height and f.get("acodec") != "none":
-            return f
-
-    for f in formats:
-        if f.get("height") and f.get("height") < wanted_height and f.get("acodec") != "none":
-            return f
-
-    return formats[0] if formats else None
-
-# -------------------------
-# ROOT
-# -------------------------
 @app.get("/")
-def root():
+def home():
     return {
-        "app": "Ytttt Ultra-Fast",
+        "app": "Ytttt",
         "status": "running",
         "endpoints": [
+            "/stats",
             "/audio",
+            "/audio.m3u8",
             "/video",
+            "/video.m3u8",
             "/video/qualities",
             "/playlist",
             "/download"
         ]
     }
 
-# -------------------------
-# AUDIO (BEST)
-# -------------------------
+@app.get("/stats")
+def stats():
+    return {
+        "cpu_percent": psutil.cpu_percent(),
+        "ram_percent": psutil.virtual_memory().percent,
+        "disk_percent": psutil.disk_usage("/").percent
+    }
+
+# --------------------------------------------------
+# AUDIO
+# --------------------------------------------------
+
 @app.get("/audio")
 def audio(url: str):
-    info = fetch_info(url)
+    cmd = base_cmd() + ["-f", "bestaudio", "-g", url]
+    p = run(cmd)
+    if p.returncode != 0:
+        return JSONResponse({"error": p.stderr}, 500)
+    return RedirectResponse(p.stdout.strip())
 
-    for f in info["formats"]:
-        if f.get("acodec") != "none" and f.get("vcodec") == "none":
-            return RedirectResponse(f["url"], headers={"User-Agent": "Mozilla/5.0"})
+@app.get("/audio.m3u8")
+def audio_m3u8(url: str):
+    cmd = base_cmd() + ["--dump-json", url]
+    p = run(cmd)
+    if p.returncode != 0:
+        return JSONResponse({"error": p.stderr}, 500)
 
-    return JSONResponse({"error": "No audio found"}, status_code=404)
+    info = json.loads(p.stdout)
+    for f in info.get("formats", []):
+        if f.get("protocol") == "m3u8_native" and f.get("acodec") != "none":
+            return RedirectResponse(f["manifest_url"])
 
-# -------------------------
+    return JSONResponse({"error": "No audio HLS found"}, 404)
+
+# --------------------------------------------------
 # VIDEO (QUALITY + AUTO FALLBACK)
-# -------------------------
+# --------------------------------------------------
+
 @app.get("/video")
 def video(
     url: str,
-    quality: str = Query("1080p", description="Example: 720p, 1080p, 2160p")
+    quality: str = Query("best", description="144p,360p,720p,1080p,2160p")
 ):
-    wanted_height = int(quality.replace("p", ""))
-    info = fetch_info(url)
+    cmd = base_cmd() + ["--dump-json", url]
+    p = run(cmd)
+    if p.returncode != 0:
+        return JSONResponse({"error": p.stderr}, 500)
 
-    formats = [
-        f for f in info["formats"]
-        if f.get("protocol") in ("https", "m3u8_native")
-    ]
+    info = json.loads(p.stdout)
 
-    selected = pick_quality(formats, wanted_height)
-    if not selected:
-        return JSONResponse({"error": "No video found"}, status_code=404)
+    wanted_height = None
+    if quality.endswith("p"):
+        wanted_height = int(quality.replace("p", ""))
 
-    stream_url = selected.get("manifest_url") or selected.get("url")
-    return RedirectResponse(stream_url, headers={"User-Agent": "Mozilla/5.0"})
+    best_match = None
+    fallback = None
 
-# -------------------------
-# VIDEO QUALITIES LIST
-# -------------------------
-@app.get("/video/qualities")
-def video_qualities(url: str):
-    info = fetch_info(url)
-    items = []
-
-    for f in info["formats"]:
-        if not f.get("height"):
+    for f in info.get("formats", []):
+        if not f.get("url"):
+            continue
+        if f.get("vcodec") == "none":
             continue
 
-        items.append({
+        h = f.get("height")
+        if not h:
+            continue
+
+        if wanted_height and h == wanted_height:
+            best_match = f
+            break
+
+        if not wanted_height:
+            fallback = f
+        elif h < wanted_height:
+            fallback = f
+
+    selected = best_match or fallback
+    if not selected:
+        return JSONResponse({"error": "No suitable format found"}, 404)
+
+    return RedirectResponse(selected["url"])
+
+@app.get("/video.m3u8")
+def video_m3u8(
+    url: str,
+    quality: str = Query("best")
+):
+    cmd = base_cmd() + ["--dump-json", url]
+    p = run(cmd)
+    if p.returncode != 0:
+        return JSONResponse({"error": p.stderr}, 500)
+
+    info = json.loads(p.stdout)
+    wanted_height = int(quality.replace("p", "")) if quality.endswith("p") else None
+
+    best = None
+    fallback = None
+
+    for f in info.get("formats", []):
+        if f.get("protocol") != "m3u8_native":
+            continue
+        if f.get("acodec") == "none":
+            continue
+
+        h = f.get("height")
+        if not h:
+            continue
+
+        if wanted_height and h == wanted_height:
+            best = f
+            break
+
+        if not wanted_height or h < wanted_height:
+            fallback = f
+
+    selected = best or fallback
+    if not selected:
+        return JSONResponse({"error": "No HLS stream found"}, 404)
+
+    return RedirectResponse(selected["manifest_url"])
+
+# --------------------------------------------------
+# VIDEO QUALITIES (ALL)
+# --------------------------------------------------
+
+@app.get("/video/qualities")
+def video_qualities(url: str):
+    cmd = base_cmd() + ["--dump-json", url]
+    p = run(cmd)
+    if p.returncode != 0:
+        return JSONResponse({"error": p.stderr}, 500)
+
+    info = json.loads(p.stdout)
+    formats = []
+
+    for f in info.get("formats", []):
+        stream = f.get("manifest_url") or f.get("url")
+        if not stream:
+            continue
+
+        formats.append({
             "format_id": f.get("format_id"),
-            "quality": f"{f.get('height')}p",
+            "quality": f"{f.get('height')}p" if f.get("height") else None,
             "fps": f.get("fps"),
             "ext": f.get("ext"),
             "has_audio": f.get("acodec") != "none",
             "protocol": f.get("protocol"),
-            "url": f.get("manifest_url") or f.get("url")
+            "url": stream
         })
 
-    items.sort(key=lambda x: int(x["quality"].replace("p", "")), reverse=True)
+    formats.sort(key=lambda x: int(x["quality"].replace("p", "")) if x["quality"] else 0, reverse=True)
 
     return {
         "title": info.get("title"),
         "duration": info.get("duration"),
-        "max_quality": items[0]["quality"] if items else None,
-        "formats": items
+        "formats": formats
     }
 
-# -------------------------
-# PLAYLIST
-# -------------------------
+# --------------------------------------------------
+# PLAYLIST (FAST, NO DOWNLOAD)
+# --------------------------------------------------
+
 @app.get("/playlist")
 def playlist(url: str):
-    p = run([
-        "yt-dlp",
-        "--flat-playlist",
-        "--dump-json",
-        url
-    ])
-
+    cmd = base_cmd() + ["--flat-playlist", "--dump-json", url]
+    p = run(cmd)
     if p.returncode != 0:
-        return JSONResponse({"error": p.stderr}, status_code=500)
+        return JSONResponse({"error": p.stderr}, 500)
 
-    return {
-        "entries": [json.loads(line) for line in p.stdout.splitlines()]
-    }
+    entries = [json.loads(line) for line in p.stdout.splitlines()]
+    return {"count": len(entries), "entries": entries}
 
-# -------------------------
-# DOWNLOAD (VPS MODE)
-# -------------------------
+# --------------------------------------------------
+# DOWNLOAD (AUTO DELETE)
+# --------------------------------------------------
+
 @app.get("/download")
 def download(
     url: str,
-    quality: str = Query("best", description="best / 720p / 1080p / 2160p")
+    quality: str = "best"
 ):
-    fmt = "best"
-    if quality != "best":
-        height = quality.replace("p", "")
-        fmt = f"bestvideo[height<={height}]+bestaudio/best"
-
     out = f"{DOWNLOAD_DIR}/%(title)s.%(ext)s"
-
-    p = run([
-        "yt-dlp",
-        "--cookies", COOKIES,
-        "-f", fmt,
-        "-o", out,
-        url
-    ])
+    cmd = base_cmd() + ["-f", quality, "-o", out, url]
+    p = run(cmd)
 
     if p.returncode != 0:
-        return JSONResponse({"error": p.stderr}, status_code=500)
+        return JSONResponse({"error": p.stderr}, 500)
 
     files = sorted(
-        os.scandir(DOWNLOAD_DIR),
-        key=lambda x: x.stat().st_mtime,
+        os.listdir(DOWNLOAD_DIR),
+        key=lambda f: os.path.getmtime(f"{DOWNLOAD_DIR}/{f}"),
         reverse=True
     )
 
-    return FileResponse(files[0].path, filename=files[0].name)
+    path = f"{DOWNLOAD_DIR}/{files[0]}"
+    response = FileResponse(path, filename=files[0])
+
+    @response.call_on_close
+    def cleanup():
+        try:
+            os.remove(path)
+        except:
+            pass
+
+    return response
