@@ -1,24 +1,21 @@
 import json
 import subprocess
-import hashlib
 import redis
 from fastapi import FastAPI, Query
 from fastapi.responses import RedirectResponse, JSONResponse
 
-app = FastAPI(title="Ytttt Ultra-Fast API")
+app = FastAPI(title="Ytttt API + Redis Cache")
 
-# ---------------- CONFIG ----------------
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-CACHE_TTL = 300  # 5 minutes
+COOKIES = "cookies.txt"
+REDIS_URL = "redis://localhost:6379"
+CACHE_TTL = 60  # seconds
 
-rdb = redis.Redis(
-    host=REDIS_HOST,
-    port=REDIS_PORT,
-    decode_responses=True
-)
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-# ---------------- HELPERS ----------------
+# ------------------------
+# Helpers
+# ------------------------
+
 def run(cmd):
     return subprocess.run(
         cmd,
@@ -27,123 +24,178 @@ def run(cmd):
         text=True
     )
 
-def cache_key(prefix: str, url: str, quality: str = ""):
-    raw = f"{prefix}:{url}:{quality}"
-    return hashlib.md5(raw.encode()).hexdigest()
+def fetch_info(url: str):
+    cache_key = f"yt:{url}"
+    cached = r.get(cache_key)
 
-def ytdlp_json(url: str):
-    cmd = [
+    if cached:
+        return json.loads(cached)
+
+    p = run([
         "yt-dlp",
-        "--cookies", "cookies.txt",
+        "--cookies", COOKIES,
         "--no-warnings",
         "--dump-json",
         url
-    ]
-    p = run(cmd)
+    ])
+
+    if p.returncode != 0:
+        raise Exception(p.stderr)
+
+    info = json.loads(p.stdout)
+
+    # ❗ Strip direct URLs before caching
+    for f in info.get("formats", []):
+        f.pop("url", None)
+        f.pop("manifest_url", None)
+
+    r.setex(cache_key, CACHE_TTL, json.dumps(info))
+    return info
+
+def fetch_live_info(url: str):
+    p = run([
+        "yt-dlp",
+        "--cookies", COOKIES,
+        "--no-warnings",
+        "--dump-json",
+        url
+    ])
     if p.returncode != 0:
         raise Exception(p.stderr)
     return json.loads(p.stdout)
 
-# ---------------- HOME ----------------
+# ------------------------
+# Root
+# ------------------------
+
 @app.get("/")
 def home():
     return {
-        "app": "Ytttt",
+        "status": "running",
+        "cache": "redis",
         "endpoints": [
             "/video",
-            "/video?quality=1080p",
+            "/video.m3u8",
+            "/audio",
+            "/audio.m3u8",
             "/video/qualities",
-            "/audio"
-        ],
-        "cache": "Redis enabled"
+            "/playlist"
+        ]
     }
 
-# ---------------- VIDEO QUALITIES ----------------
+# ------------------------
+# VIDEO (progressive)
+# ------------------------
+
+@app.get("/video")
+def video(url: str, quality: str | None = None):
+    info = fetch_live_info(url)
+
+    vids = [
+        f for f in info["formats"]
+        if f.get("url")
+        and f.get("vcodec") != "none"
+        and f.get("protocol") != "m3u8_native"
+    ]
+
+    if quality:
+        q = int(quality.replace("p", ""))
+        vids.sort(key=lambda f: abs((f.get("height") or 0) - q))
+    else:
+        vids.sort(key=lambda f: f.get("height") or 0, reverse=True)
+
+    return RedirectResponse(vids[0]["url"])
+
+# ------------------------
+# VIDEO HLS
+# ------------------------
+
+@app.get("/video.m3u8")
+def video_m3u8(url: str, quality: str | None = None):
+    info = fetch_live_info(url)
+
+    hls = [
+        f for f in info["formats"]
+        if f.get("protocol") == "m3u8_native"
+        and f.get("acodec") != "none"
+    ]
+
+    if not hls:
+        return JSONResponse({"error": "No HLS video"}, status_code=404)
+
+    if quality:
+        q = int(quality.replace("p", ""))
+        hls.sort(key=lambda f: abs((f.get("height") or 0) - q))
+    else:
+        hls.sort(key=lambda f: f.get("height") or 0, reverse=True)
+
+    return RedirectResponse(hls[0]["manifest_url"])
+
+# ------------------------
+# AUDIO
+# ------------------------
+
+@app.get("/audio")
+def audio(url: str):
+    info = fetch_live_info(url)
+    aud = [f for f in info["formats"] if f.get("vcodec") == "none" and f.get("url")]
+    aud.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+    return RedirectResponse(aud[0]["url"])
+
+@app.get("/audio.m3u8")
+def audio_m3u8(url: str):
+    info = fetch_live_info(url)
+    for f in info["formats"]:
+        if f.get("protocol") == "m3u8_native" and f.get("vcodec") == "none":
+            return RedirectResponse(f["manifest_url"])
+    return JSONResponse({"error": "No audio HLS"}, status_code=404)
+
+# ------------------------
+# VIDEO QUALITIES
+# ------------------------
+
 @app.get("/video/qualities")
-def video_qualities(url: str = Query(...)):
-    key = cache_key("qualities", url)
-    cached = rdb.get(key)
-    if cached:
-        return json.loads(cached)
+def video_qualities(url: str):
+    info = fetch_live_info(url)
+    out = []
 
-    info = ytdlp_json(url)
-
-    formats = []
-    for f in info.get("formats", []):
-        stream = f.get("manifest_url") if f.get("protocol") == "m3u8_native" else f.get("url")
+    for f in info["formats"]:
+        stream = f.get("manifest_url") or f.get("url")
         if not stream:
             continue
-        formats.append({
-            "format_id": f.get("format_id"),
+        out.append({
             "height": f.get("height"),
             "quality": f"{f.get('height')}p" if f.get("height") else None,
-            "fps": f.get("fps"),
-            "ext": f.get("ext"),
             "has_audio": f.get("acodec") != "none",
             "is_hls": f.get("protocol") == "m3u8_native",
             "url": stream
         })
 
-    formats.sort(key=lambda x: x["height"] or 0, reverse=True)
+    out.sort(key=lambda x: x["height"] or 0, reverse=True)
 
-    data = {
+    return {
         "title": info.get("title"),
         "duration": info.get("duration"),
-        "max_quality": f"{formats[0]['height']}p" if formats else None,
-        "formats": formats
+        "formats": out
     }
 
-    rdb.setex(key, CACHE_TTL, json.dumps(data))
-    return data
+# ------------------------
+# PLAYLIST
+# ------------------------
 
-# ---------------- VIDEO WITH QUALITY + AUTO FALLBACK ----------------
-@app.get("/video")
-def video(
-    url: str = Query(...),
-    quality: str = Query(None)  # ex: 2160p, 1080p
-):
-    key = cache_key("video", url, quality or "best")
-    cached = rdb.get(key)
-    if cached:
-        return RedirectResponse(cached)
+@app.get("/playlist")
+def playlist(url: str):
+    p = run([
+        "yt-dlp",
+        "--cookies", COOKIES,
+        "--flat-playlist",
+        "--dump-json",
+        url
+    ])
 
-    info = ytdlp_json(url)
+    if p.returncode != 0:
+        return JSONResponse({"error": p.stderr}, status_code=500)
 
-    wanted_height = int(quality.replace("p", "")) if quality else None
-    best = None
-
-    for f in info.get("formats", []):
-        if f.get("acodec") == "none":
-            continue
-        if wanted_height and f.get("height") == wanted_height:
-            best = f
-            break
-
-    if not best:
-        for f in reversed(info.get("formats", [])):
-            if f.get("acodec") != "none":
-                best = f
-                break
-
-    if not best or not best.get("url"):
-        return JSONResponse({"error": "No playable format"}, status_code=404)
-
-    rdb.setex(key, CACHE_TTL, best["url"])
-    return RedirectResponse(best["url"])
-
-# ---------------- AUDIO (BEST) ----------------
-@app.get("/audio")
-def audio(url: str = Query(...)):
-    key = cache_key("audio", url)
-    cached = rdb.get(key)
-    if cached:
-        return RedirectResponse(cached)
-
-    info = ytdlp_json(url)
-
-    for f in info.get("formats", []):
-        if f.get("vcodec") == "none" and f.get("url"):
-            rdb.setex(key, CACHE_TTL, f["url"])
-            return RedirectResponse(f["url"])
-
-    return JSONResponse({"error": "No audio found"}, status_code=404)
+    return {
+        "entries": [json.loads(line) for line in p.stdout.splitlines()]
+    }
