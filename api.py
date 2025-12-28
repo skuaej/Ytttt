@@ -1,266 +1,162 @@
-import osimport time
+import os
+import time
+import json
 import uuid
-import psutil
+import shutil
 import subprocess
+import psutil
+
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
-app = FastAPI(title="Ytttt API")
-
-DOWNLOAD_DIR = "downloads"
-COOKIES_FILE = "cookies.txt"
+APP_DIR = os.getcwd()
+DOWNLOAD_DIR = f"{APP_DIR}/downloads"
+COOKIE_FILE = f"{APP_DIR}/cookies.txt"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-
-# -------------------------
-# SYSTEM STATS
-# -------------------------
-@app.get("/stats")
-def stats():
-    return {
-        "cpu_percent": psutil.cpu_percent(interval=1),
-        "ram_percent": psutil.virtual_memory().percent,
-        "disk_percent": psutil.disk_usage("/").percent,
-        "uptime_seconds": int(time.time() - psutil.boot_time()),
-    }
+app = FastAPI(title="Ytttt API", version="1.0.0")
 
 
-# ---------------import subprocess
-import json
-import time
-import psutil
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
-
-app = FastAPI(title="YT Stream API (Stable)")
-
-YTDLP = "yt-dlp"
-COOKIES = "cookies.txt"
-START_TIME = time.time()
-
-
-# --------------------
-# Utils
-# --------------------
-def uptime():
-    s = int(time.time() - START_TIME)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    return f"{h}h {m}m {s}s"
-
-
-def run(cmd, timeout=60):
-    return subprocess.run(
+# -----------------------
+# UTIL FUNCTIONS
+# -----------------------
+def run(cmd):
+    p = subprocess.run(
         cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
     )
+    if p.returncode != 0:
+        raise Exception(p.stderr)
+    return p.stdout
 
 
-def base_cmd():
+def yt_formats(url: str):
     cmd = [
-        YTDLP,
-        "--force-ipv4",
-        "--user-agent", "Mozilla/5.0",
-        "--remote-components", "ejs:github",
-        "--dump-json"
+        "yt-dlp",
+        "--cookies", COOKIE_FILE,
+        "-J",
+        url
     ]
-    if COOKIES:
-        cmd += ["--cookies", COOKIES]
-    return cmd
+    out = run(cmd)
+    return json.loads(out)
 
 
-# --------------------
-# Health
-# --------------------
-@app.get("/")
-def root():
-    return {
-        "status": "running",
-        "uptime": uptime(),
-        "endpoints": [
-            "/ping",
-            "/status",
-            "/audio",
-            "/video",
-            "/video/qualities"
-        ]
-    }
-
-
+# -----------------------
+# HEALTH / STATS
+# -----------------------
 @app.get("/ping")
 def ping():
-    return {"ping": "pong", "uptime": uptime()}
-
-
-@app.get("/status")
-def status():
-    cpu = psutil.cpu_percent(interval=0.4)
-    ram = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
-
     return {
-        "cpu_percent": cpu,
-        "ram_percent": ram.percent,
-        "disk_percent": disk.percent
+        "status": "ok",
+        "uptime_sec": int(time.time() - psutil.boot_time()),
+        "cpu_percent": psutil.cpu_percent(),
+        "ram_percent": psutil.virtual_memory().percent,
+        "disk_percent": psutil.disk_usage("/").percent
     }
 
 
-# --------------------
-# AUDIO (SAFE)
-# --------------------
-@app.get("/audio")
-def audio(url: str = Query(...)):
-    cmd = [
-        YTDLP,
-        "--cookies", COOKIES,
-        "-f", "bestaudio",
-        "-g",
-        url
-    ]
-    p = run(cmd)
-
-    if p.returncode != 0:
-        return JSONResponse({"error": p.stderr}, status_code=500)
-
-    return {
-        "type": "audio",
-        "url": p.stdout.strip()
-    }
-
-
-# --------------------
-# VIDEO (SAFE STREAM)
-# m3u8 ONLY — WITH AUDIO
-# --------------------
-@app.get("/video")
-def video(
-    url: str = Query(...),
-    quality: str = Query("best")
-):
-    # Map quality → m3u8 itags
-    quality_map = {
-        "144p": "91",
-        "240p": "92",
-        "360p": "93",
-        "480p": "94",
-        "720p": "95",
-        "1080p": "96"
-    }
-
-    itag = quality_map.get(quality, "best")
-
-    fmt = f"{itag}/best[protocol^=m3u8]/best"
-
-    cmd = [
-        YTDLP,
-        "--cookies", COOKIES,
-        "-f", fmt,
-        "-g",
-        url
-    ]
-
-    p = run(cmd)
-
-    if p.returncode != 0 or not p.stdout.strip():
-        return JSONResponse({"error": p.stderr}, status_code=500)
-
-    return {
-        "type": "video",
-        "quality": quality,
-        "stream": p.stdout.strip()
-    }
-
-
-# --------------------
-# VIDEO QUALITIES LIST
-# (INCLUDES m3u8 + DASH)
-# --------------------
+# -----------------------
+# VIDEO QUALITIES
+# -----------------------
 @app.get("/video/qualities")
 def video_qualities(url: str = Query(...)):
-    p = run(base_cmd() + [url], timeout=90)
+    info = yt_formats(url)
 
-    if p.returncode != 0:
-        return JSONResponse({"error": p.stderr}, status_code=500)
-
-    info = json.loads(p.stdout)
     formats = []
-
-    for f in info.get("formats", []):
-        if not f.get("url"):
-            continue
-
-        formats.append({
-            "format_id": f.get("format_id"),
-            "resolution": f.get("resolution"),
-            "height": f.get("height"),
-            "fps": f.get("fps"),
-            "ext": f.get("ext"),
-            "has_audio": f.get("acodec") != "none",
-            "protocol": f.get("protocol"),
-            "is_m3u8": "m3u8" in (f.get("protocol") or ""),
-            "url": f.get("url")
-        })
+    for f in info["formats"]:
+        if f.get("vcodec") != "none":
+            formats.append({
+                "format_id": f["format_id"],
+                "ext": f["ext"],
+                "resolution": f.get("resolution"),
+                "fps": f.get("fps"),
+                "filesize": f.get("filesize"),
+                "has_audio": f.get("acodec") != "none",
+                "protocol": f.get("protocol")
+            })
 
     return {
         "title": info.get("title"),
         "duration": info.get("duration"),
-        "total_formats": len(formats),
         "formats": formats
-    }----------
-# GET VIDEO QUALITIES
-# -------------------------
-@app.get("/video/qualities")
-def video_qualities(url: str = Query(...)):
-    cmd = [
-        "yt-dlp",
-        "-F",
-        "--cookies", COOKIES_FILE,
-        "--no-warnings",
-        url
-    ]
-
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(500, e.output.decode())
-
-    return {
-        "url": url,
-        "formats_raw": out
     }
 
 
-# -------------------------
-# STREAM (MERGED AUDIO+VIDEO)
-# -------------------------
-@app.get("/video")
-def stream_video(
-    url: str,
-    quality: str = "best"
-):
-    stream_id = str(uuid.uuid4())
-    out_file = f"{DOWNLOAD_DIR}/{stream_id}.mp4"
+# -----------------------
+# HLS VIDEO (WITH AUDIO)
+# -----------------------
+@app.get("/video.m3u8")
+def video_hls(url: str = Query(...)):
+    cmd = [
+        "yt-dlp",
+        "--cookies", COOKIE_FILE,
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "--hls-use-mpegts",
+        "-g",
+        url
+    ]
+    out = run(cmd)
+    return {"hls_url": out.strip()}
 
-    # bestvideo+bestaudio MERGE (audio FIX)
-    format_selector = (
-        f"bestvideo[height<={quality.replace('p','')}]+bestaudio/best"
-        if quality != "best"
-        else "bestvideo+bestaudio/best"
-    )
+
+# -----------------------
+# HLS AUDIO
+# -----------------------
+@app.get("/audio.m3u8")
+def audio_hls(url: str = Query(...)):
+    cmd = [
+        "yt-dlp",
+        "--cookies", COOKIE_FILE,
+        "-f", "ba",
+        "-g",
+        url
+    ]
+    out = run(cmd)
+    return {"audio_url": out.strip()}
+
+
+# -----------------------
+# DOWNLOAD (MERGED)
+# -----------------------
+@app.get("/download")
+def download(
+    url: str = Query(...),
+    quality: str = Query("best")
+):
+    file_id = str(uuid.uuid4())
+    out_file = f"{DOWNLOAD_DIR}/{file_id}.mp4"
+
+    format_map = {
+        "144p": "bv*[height<=144]+ba/b",
+        "240p": "bv*[height<=240]+ba/b",
+        "360p": "bv*[height<=360]+ba/b",
+        "480p": "bv*[height<=480]+ba/b",
+        "720p": "bv*[height<=720]+ba/b",
+        "1080p": "bv*[height<=1080]+ba/b",
+        "1440p": "bv*[height<=1440]+ba/b",
+        "2160p": "bv*[height<=2160]+ba/b",
+        "best": "bv*+ba/b"
+    }
+
+    fmt = format_map.get(quality, format_map["best"])
 
     cmd = [
         "yt-dlp",
-        "--cookies", COOKIES_FILE,
-        "-f", format_selector,
+        "--cookies", COOKIE_FILE,
+        "-f", fmt,
         "--merge-output-format", "mp4",
         "-o", out_file,
         url
     ]
 
-    try:
-        subprocess.check_call(cmd)
-    except subprocess.CalledProcessError:
-        raise HTTPException(500, "Failed to stream video")
+    run(cmd)
+
+    return FileResponse(
+        out_file,
+        media_type="video/mp4",
+        filename=os.path.basename(out_file)
+    )
