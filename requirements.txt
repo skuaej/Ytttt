@@ -1,6 +1,6 @@
 # requirements.txt
 
-
+yt-dlp-ejs
 
 yt-dlp==2024.12.23
 
