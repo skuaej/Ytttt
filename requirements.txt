@@ -1,8 +1,6 @@
-fastapi
-uvicorn
-yt-dlp
-anyio
+# requirements.txt
 fastapi
 uvicorn
 psutil
 yt-dlp
+yt-dlp-ejs
