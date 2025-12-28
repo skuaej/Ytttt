@@ -1,28 +1,23 @@
-# -------- Base image --------
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-# -------- System dependencies --------
-# ffmpeg is NOT used for merging
-# but yt-dlp requires it for metadata + some formats
+# System deps
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    redis-server \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# -------- Install Deno (EJS solver) --------
-RUN curl -fsSL https://deno.land/install.sh | sh
-ENV PATH="/root/.deno/bin:${PATH}"
-
-# -------- Python dependencies --------
+# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# -------- App files --------
+# Copy app
 COPY . .
 
-# -------- Run API --------
-CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Start Redis + API
+CMD redis-server --daemonize yes && \
+    uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}
