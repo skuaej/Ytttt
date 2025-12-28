@@ -10,7 +10,7 @@ app = FastAPI(title="YouTube Stream API")
 # CONFIG
 # ==========================
 YTDLP = "yt-dlp"
-COOKIES = "cookies.txt"  # must exist in /app
+COOKIES = "cookies.txt"  # must exist for restricted videos
 START_TIME = time.time()
 
 # ==========================
@@ -36,11 +36,22 @@ def base_cmd(dump_json=False):
         "--remote-components", "ejs:github",
         "--force-ipv4",
         "--user-agent", "Mozilla/5.0",
-        "--cookies", COOKIES,
-        "--extractor-args", "youtube:player_client=android",
     ]
+
+    # IMPORTANT: android client does NOT support cookies
+    if COOKIES:
+        cmd += [
+            "--cookies", COOKIES,
+            "--extractor-args", "youtube:player_client=web,ios"
+        ]
+    else:
+        cmd += [
+            "--extractor-args", "youtube:player_client=android"
+        ]
+
     if dump_json:
         cmd.append("--dump-json")
+
     return cmd
 
 # ==========================
@@ -72,7 +83,10 @@ async def audio(url: str = Query(...)):
 
     p = run(cmd)
     if p.returncode != 0 or not p.stdout.strip():
-        return JSONResponse({"error": p.stderr}, status_code=500)
+        return JSONResponse(
+            {"error": p.stderr},
+            status_code=500
+        )
 
     return {
         "status": "success",
@@ -86,17 +100,14 @@ async def audio(url: str = Query(...)):
 @app.get("/video")
 async def video(
     url: str = Query(...),
-    quality: str | None = Query(default=None, description="e.g. 720p, 480p")
+    quality: str | None = Query(default=None)
 ):
-    # --------------------------
-    # FORMAT SELECTION
-    # --------------------------
     if quality:
         try:
             height = int(quality.replace("p", ""))
         except ValueError:
             return JSONResponse(
-                {"error": "Invalid quality format. Use 720p, 480p, etc."},
+                {"error": "Invalid quality. Use 720p, 480p, etc."},
                 status_code=400
             )
 
@@ -106,9 +117,7 @@ async def video(
             f"bv*[height<={height}]/best"
         )
     else:
-        format_selector = (
-            "bv*[protocol^=m3u8]/bv*+ba/b"
-        )
+        format_selector = "bv*[protocol^=m3u8]/bv*+ba/b"
 
     cmd = base_cmd() + [
         "-f", format_selector,
@@ -118,14 +127,17 @@ async def video(
 
     p = run(cmd)
     if p.returncode != 0 or not p.stdout.strip():
-        return JSONResponse({"error": p.stderr}, status_code=500)
+        return JSONResponse(
+            {"error": p.stderr},
+            status_code=500
+        )
 
     stream_url = p.stdout.strip()
 
     return {
         "status": "success",
         "quality": quality or "best",
-        "type": "m3u8" if "manifest.googlevideo.com" in stream_url else "dash",
+        "stream_type": "m3u8" if "manifest.googlevideo.com" in stream_url else "dash",
         "url": stream_url
     }
 
@@ -138,11 +150,14 @@ async def video_qualities(url: str = Query(...)):
     p = run(cmd)
 
     if p.returncode != 0:
-        return JSONResponse({"error": p.stderr}, status_code=500)
+        return JSONResponse(
+            {"error": p.stderr},
+            status_code=500
+        )
 
     info = json.loads(p.stdout)
-
     formats = []
+
     for f in info.get("formats", []):
         if not f.get("url"):
             continue
