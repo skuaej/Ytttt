@@ -1,189 +1,66 @@
+# api.py — yt-dlp with Deno + yt-dlp-ejs (NO Node.js)
+# Requirements:
+#   pipx install yt-dlp yt-dlp-ejs
+#   deno installed and on PATH
+#   cookies.txt optional (same directory)
+
 import time
 import psutil
 import subprocess
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="YT Stream API")
+app = FastAPI(title="YT Stream API (EJS + Deno)")
 
-# ==========================
-# START TIME
-# ==========================
 START_TIME = time.time()
-
-# ==========================
-# CONFIG
-# ==========================
 YTDLP = "yt-dlp"
 COOKIES = "cookies.txt"
-MAX_VIDEO_QUALITY = "360p"
 
-# ==========================
-# UTILS
-# ==========================
 def uptime():
     s = int(time.time() - START_TIME)
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
     return f"{h}h {m}m {s}s"
 
+def run(cmd, timeout=60):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
-def load_level(cpu):
-    if cpu < 40:
-        return "LOW"
-    elif cpu < 70:
-        return "MEDIUM"
-    return "HIGH"
-
-
-# ==========================
-# ROOT / HEALTH
-# ==========================
 @app.get("/")
 async def root():
-    return {
-        "status": "running",
-        "uptime": uptime(),
-        "endpoints": ["/audio", "/video", "/status", "/ping"]
-    }
-
+    return {"status": "running", "uptime": uptime(), "endpoints": ["/audio", "/video", "/status", "/ping"]}
 
 @app.get("/ping")
 async def ping():
-    return {"ping": "pong", "uptime": uptime()}
+    return {"ping": "pong"}
 
-
-# ==========================
-# SERVER STATUS
-# ==========================
 @app.get("/status")
 async def status():
-    cpu = psutil.cpu_percent(interval=0.5)
+    cpu = psutil.cpu_percent(interval=0.3)
     ram = psutil.virtual_memory()
+    return {"cpu": cpu, "ram_mb": int(ram.used/1024/1024), "uptime": uptime()}
 
-    return {
-        "cpu": {
-            "usage_percent": cpu,
-            "load_level": load_level(cpu)
-        },
-        "ram": {
-            "total_mb": int(ram.total / 1024 / 1024),
-            "used_mb": int(ram.used / 1024 / 1024),
-            "usage_percent": ram.percent
-        },
-        "policy": {
-            "video_allowed": cpu < 80,
-            "max_video_quality": MAX_VIDEO_QUALITY
-        }
-    }
+def base_args():
+    return [
+        YTDLP,
+        "--remote-components", "ejs:github",   # enable EJS (Deno)
+        "--force-ipv4",
+        "--user-agent", "Mozilla/5.0",
+    ] + (["--cookies", COOKIES] if COOKIES else [])
 
-
-# ==========================
-# AUDIO STREAM
-# ==========================
 @app.get("/audio")
 async def audio(url: str = Query(...)):
-    try:
-        cmd = [
-            YTDLP,
-            "--cookies", COOKIES,
-            "--force-ipv4",
-            "--user-agent", "Mozilla/5.0",
-            "-f", "bestaudio",
-            "-g",
-            url
-        ]
+    cmd = base_args() + ["-f", "bestaudio", "-g", url]
+    p = run(cmd)
+    if p.returncode != 0 or not p.stdout.strip():
+        return JSONResponse({"status": "error", "stderr": p.stderr}, status_code=500)
+    return {"status": "success", "audio": p.stdout.strip()}
 
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=45
-        )
-
-        if proc.returncode != 0:
-            return JSONResponse(
-                {
-                    "status": "error",
-                    "stderr": proc.stderr
-                },
-                status_code=500
-            )
-
-        stream = proc.stdout.strip()
-        if not stream:
-            return JSONResponse(
-                {"status": "error", "reason": "empty_audio_url"},
-                status_code=500
-            )
-
-        return {
-            "status": "success",
-            "audio": stream
-        }
-
-    except Exception as e:
-        return JSONResponse(
-            {"status": "exception", "reason": str(e)},
-            status_code=500
-        )
-
-
-# ==========================
-# VIDEO STREAM (360p)
-# ==========================
 @app.get("/video")
 async def video(url: str = Query(...)):
-    cpu = psutil.cpu_percent(interval=0.3)
-
-    if cpu > 80:
-        return JSONResponse(
-            {"status": "blocked", "reason": "high_cpu"},
-            status_code=503
-        )
-
-    try:
-        cmd = [
-            YTDLP,
-            "--cookies", COOKIES,
-            "--force-ipv4",
-            "--user-agent", "Mozilla/5.0",
-            "-f", "bv*[height<=360]+ba/b",
-            "-g",
-            url
-        ]
-
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-
-        if proc.returncode != 0:
-            return JSONResponse(
-                {
-                    "status": "error",
-                    "stderr": proc.stderr
-                },
-                status_code=500
-            )
-
-        stream = proc.stdout.strip()
-        if not stream:
-            return JSONResponse(
-                {"status": "error", "reason": "empty_video_url"},
-                status_code=500
-            )
-
-        return {
-            "status": "success",
-            "quality": "360p",
-            "video": stream
-        }
-
-    except Exception as e:
-        return JSONResponse(
-            {"status": "exception", "reason": str(e)},
-            status_code=500
-        )
+    if psutil.cpu_percent(interval=0.2) > 80:
+        return JSONResponse({"status": "blocked", "reason": "high_cpu"}, status_code=503)
+    cmd = base_args() + ["-f", "bv*+ba/b", "-g", url]
+    p = run(cmd)
+    if p.returncode != 0 or not p.stdout.strip():
+        return JSONResponse({"status": "error", "stderr": p.stderr}, status_code=500)
+    return {"status": "success", "video": p.stdout.strip()}
