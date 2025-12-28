@@ -2,8 +2,7 @@
 
 
 
-yt-dlp
-yt-dlp-ejs
+yt-dlp==2024.12.23
 
 fastapi==0.110.0
 uvicorn==0.29.0
