@@ -1,13 +1,14 @@
-import os
 import time
 import psutil
-import asyncio
 import subprocess
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="YT Stream API")
 
+# ==========================
+# START TIME
+# ==========================
 START_TIME = time.time()
 
 # ==========================
@@ -36,7 +37,7 @@ def load_level(cpu):
 
 
 # ==========================
-# HEALTH / PING
+# ROOT / HEALTH
 # ==========================
 @app.get("/")
 async def root():
@@ -86,24 +87,33 @@ async def audio(url: str = Query(...)):
         cmd = [
             YTDLP,
             "--cookies", COOKIES,
-            "--remote-components", "ejs:github",
             "--force-ipv4",
+            "--user-agent", "Mozilla/5.0",
             "-f", "bestaudio",
             "-g",
-            url,
+            url
         ]
 
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=20
+            timeout=45
         )
+
+        if proc.returncode != 0:
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "stderr": proc.stderr
+                },
+                status_code=500
+            )
 
         stream = proc.stdout.strip()
         if not stream:
             return JSONResponse(
-                {"status": "error", "reason": "audio_not_found"},
+                {"status": "error", "reason": "empty_audio_url"},
                 status_code=500
             )
 
@@ -114,7 +124,7 @@ async def audio(url: str = Query(...)):
 
     except Exception as e:
         return JSONResponse(
-            {"status": "error", "reason": str(e)},
+            {"status": "exception", "reason": str(e)},
             status_code=500
         )
 
@@ -136,24 +146,33 @@ async def video(url: str = Query(...)):
         cmd = [
             YTDLP,
             "--cookies", COOKIES,
-            "--remote-components", "ejs:github",
             "--force-ipv4",
+            "--user-agent", "Mozilla/5.0",
             "-f", "bv*[height<=360]+ba/b",
             "-g",
-            url,
+            url
         ]
 
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=25
+            timeout=60
         )
+
+        if proc.returncode != 0:
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "stderr": proc.stderr
+                },
+                status_code=500
+            )
 
         stream = proc.stdout.strip()
         if not stream:
             return JSONResponse(
-                {"status": "error", "reason": "video_not_found"},
+                {"status": "error", "reason": "empty_video_url"},
                 status_code=500
             )
 
@@ -165,6 +184,6 @@ async def video(url: str = Query(...)):
 
     except Exception as e:
         return JSONResponse(
-            {"status": "error", "reason": str(e)},
+            {"status": "exception", "reason": str(e)},
             status_code=500
         )
