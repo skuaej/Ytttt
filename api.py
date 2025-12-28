@@ -1,162 +1,125 @@
-import os
-import time
 import json
-import uuid
-import shutil
+import time
 import subprocess
+import os
 import psutil
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
 
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+app = FastAPI(title="Ytttt API", version="1.1.0")
 
-APP_DIR = os.getcwd()
-DOWNLOAD_DIR = f"{APP_DIR}/downloads"
-COOKIE_FILE = f"{APP_DIR}/cookies.txt"
-
+YTDLP = "yt-dlp"
+COOKIES = "cookies.txt"
+DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-app = FastAPI(title="Ytttt API", version="1.0.0")
-
-
-# -----------------------
-# UTIL FUNCTIONS
-# -----------------------
+# -------------------------
+# HELPERS
+# -------------------------
 def run(cmd):
-    p = subprocess.run(
+    return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
     )
-    if p.returncode != 0:
-        raise Exception(p.stderr)
-    return p.stdout
 
-
-def yt_formats(url: str):
-    cmd = [
-        "yt-dlp",
-        "--cookies", COOKIE_FILE,
-        "-J",
-        url
+def base_cmd():
+    return [
+        YTDLP,
+        "--cookies", COOKIES,
+        "--user-agent", "Mozilla/5.0",
+        "--dump-json",
+        "--no-warnings"
     ]
-    out = run(cmd)
-    return json.loads(out)
 
-
-# -----------------------
-# HEALTH / STATS
-# -----------------------
-@app.get("/ping")
-def ping():
+# -------------------------
+# STATS
+# -------------------------
+@app.get("/stats")
+def stats():
     return {
-        "status": "ok",
-        "uptime_sec": int(time.time() - psutil.boot_time()),
         "cpu_percent": psutil.cpu_percent(),
         "ram_percent": psutil.virtual_memory().percent,
-        "disk_percent": psutil.disk_usage("/").percent
+        "disk_percent": psutil.disk_usage("/").percent,
     }
 
+# -------------------------
+# MANUAL QUALITY STREAM
+# -------------------------
+@app.get("/video/quality")
+def video_quality(
+    url: str = Query(...),
+    res: int = Query(720, description="144–2160 (8K if available)")
+):
+    cmd = base_cmd() + [url]
+    p = run(cmd)
 
-# -----------------------
-# VIDEO QUALITIES
-# -----------------------
-@app.get("/video/qualities")
-def video_qualities(url: str = Query(...)):
-    info = yt_formats(url)
+    if p.returncode != 0:
+        return JSONResponse({"error": p.stderr}, status_code=500)
 
-    formats = []
-    for f in info["formats"]:
-        if f.get("vcodec") != "none":
-            formats.append({
-                "format_id": f["format_id"],
-                "ext": f["ext"],
-                "resolution": f.get("resolution"),
-                "fps": f.get("fps"),
-                "filesize": f.get("filesize"),
-                "has_audio": f.get("acodec") != "none",
-                "protocol": f.get("protocol")
-            })
+    info = json.loads(p.stdout)
+    candidates = []
 
-    return {
-        "title": info.get("title"),
-        "duration": info.get("duration"),
-        "formats": formats
-    }
+    for f in info.get("formats", []):
+        if not f.get("height"):
+            continue
+        if f["height"] <= res:
+            candidates.append(f)
 
+    # prefer HLS with audio
+    candidates.sort(
+        key=lambda x: (
+            x.get("protocol") != "m3u8_native",
+            abs(x.get("height", 0) - res)
+        )
+    )
 
-# -----------------------
-# HLS VIDEO (WITH AUDIO)
-# -----------------------
-@app.get("/video.m3u8")
-def video_hls(url: str = Query(...)):
-    cmd = [
-        "yt-dlp",
-        "--cookies", COOKIE_FILE,
-        "-f", "bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "--hls-use-mpegts",
-        "-g",
-        url
-    ]
-    out = run(cmd)
-    return {"hls_url": out.strip()}
+    if not candidates:
+        return JSONResponse({"error": "Requested quality not available"}, status_code=404)
 
+    f = candidates[0]
+    stream_url = f.get("manifest_url") if f.get("protocol") == "m3u8_native" else f.get("url")
 
-# -----------------------
-# HLS AUDIO
-# -----------------------
-@app.get("/audio.m3u8")
-def audio_hls(url: str = Query(...)):
-    cmd = [
-        "yt-dlp",
-        "--cookies", COOKIE_FILE,
-        "-f", "ba",
-        "-g",
-        url
-    ]
-    out = run(cmd)
-    return {"audio_url": out.strip()}
+    return RedirectResponse(stream_url)
 
-
-# -----------------------
-# DOWNLOAD (MERGED)
-# -----------------------
+# -------------------------
+# DOWNLOAD ENDPOINT
+# -------------------------
 @app.get("/download")
 def download(
     url: str = Query(...),
-    quality: str = Query("best")
+    res: int | None = Query(None, description="Optional quality like 720,1080")
 ):
-    file_id = str(uuid.uuid4())
-    out_file = f"{DOWNLOAD_DIR}/{file_id}.mp4"
+    fmt = (
+        f"bestvideo[height<={res}]+bestaudio/best"
+        if res else
+        "bestvideo+bestaudio/best"
+    )
 
-    format_map = {
-        "144p": "bv*[height<=144]+ba/b",
-        "240p": "bv*[height<=240]+ba/b",
-        "360p": "bv*[height<=360]+ba/b",
-        "480p": "bv*[height<=480]+ba/b",
-        "720p": "bv*[height<=720]+ba/b",
-        "1080p": "bv*[height<=1080]+ba/b",
-        "1440p": "bv*[height<=1440]+ba/b",
-        "2160p": "bv*[height<=2160]+ba/b",
-        "best": "bv*+ba/b"
-    }
-
-    fmt = format_map.get(quality, format_map["best"])
+    out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
     cmd = [
-        "yt-dlp",
-        "--cookies", COOKIE_FILE,
+        YTDLP,
+        "--cookies", COOKIES,
         "-f", fmt,
+        "-o", out,
         "--merge-output-format", "mp4",
-        "-o", out_file,
         url
     ]
 
-    run(cmd)
+    p = run(cmd)
+    if p.returncode != 0:
+        return JSONResponse({"error": p.stderr}, status_code=500)
+
+    files = sorted(
+        os.scandir(DOWNLOAD_DIR),
+        key=lambda x: x.stat().st_mtime,
+        reverse=True
+    )
 
     return FileResponse(
-        out_file,
-        media_type="video/mp4",
-        filename=os.path.basename(out_file)
+        files[0].path,
+        filename=files[0].name,
+        media_type="application/octet-stream"
     )
