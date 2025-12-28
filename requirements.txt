@@ -4,3 +4,4 @@ uvicorn
 psutil
 yt-dlp
 yt-dlp-ejs
+redis
