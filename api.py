@@ -1,149 +1,161 @@
 import os
-import json
 import time
+import uuid
 import psutil
 import subprocess
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
-app = FastAPI(title="Ytttt – YouTube Merge API")
+app = FastAPI(title="Ytttt API")
 
-BASE_DIR = os.path.dirname(__file__)
-DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+DOWNLOAD_DIR = "downloads"
+COOKIES_FILE = "cookies.txt"
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-YTDLP = "yt-dlp"
-FFMPEG = "ffmpeg"
-START_TIME = time.time()
 
-
-# -----------------------------
-# UTILITIES
-# -----------------------------
-def run(cmd, timeout=300):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-
-
-def uptime():
-    s = int(time.time() - START_TIME)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    return f"{h}h {m}m {s}s"
-
-
-def system_stats():
+# -------------------------
+# SYSTEM STATS
+# -------------------------
+@app.get("/stats")
+def stats():
     return {
-        "cpu_percent": psutil.cpu_percent(),
+        "cpu_percent": psutil.cpu_percent(interval=1),
         "ram_percent": psutil.virtual_memory().percent,
         "disk_percent": psutil.disk_usage("/").percent,
+        "uptime_seconds": int(time.time() - psutil.boot_time()),
     }
 
 
-# -----------------------------
-# ROOT
-# -----------------------------
-@app.get("/")
-async def root():
-    return {
-        "app": "Ytttt",
-        "status": "running",
-        "uptime": uptime(),
-        "stats": system_stats(),
-        "endpoints": [
-            "/video?url=&quality=720p",
-            "/video/qualities?url=",
-            "/audio?url="
-        ],
-    }
-
-
-# -----------------------------
-# GET AVAILABLE QUALITIES
-# -----------------------------
+# -------------------------
+# GET VIDEO QUALITIES
+# -------------------------
 @app.get("/video/qualities")
-async def video_qualities(url: str = Query(...)):
-    cmd = [YTDLP, "--dump-json", url]
-    p = run(cmd)
-
-    if p.returncode != 0:
-        return JSONResponse({"error": p.stderr}, status_code=500)
-
-    info = json.loads(p.stdout)
-
-    qualities = set()
-    for f in info.get("formats", []):
-        h = f.get("height")
-        if h:
-            qualities.add(f"{h}p")
-
-    return {
-        "title": info.get("title"),
-        "duration": info.get("duration"),
-        "available_qualities": sorted(
-            qualities, key=lambda x: int(x.replace("p", ""))
-        )
-    }
-
-
-# -----------------------------
-# AUDIO ONLY
-# -----------------------------
-@app.get("/audio")
-async def audio(url: str = Query(...)):
-    out = os.path.join(DOWNLOAD_DIR, "audio.m4a")
-
+def video_qualities(url: str = Query(...)):
     cmd = [
-        YTDLP,
-        "-f", "bestaudio[ext=m4a]/bestaudio",
-        "-o", out,
+        "yt-dlp",
+        "-F",
+        "--cookies", COOKIES_FILE,
+        "--no-warnings",
         url
     ]
 
-    p = run(cmd)
-    if p.returncode != 0:
-        return JSONResponse({"error": p.stderr}, status_code=500)
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(500, e.output.decode())
 
-    return FileResponse(out, filename="audio.m4a", media_type="audio/mp4")
+    return {
+        "url": url,
+        "formats_raw": out
+    }
 
 
-# -----------------------------
-# VIDEO + AUDIO MERGED
-# -----------------------------
+# -------------------------
+# STREAM (MERGED AUDIO+VIDEO)
+# -------------------------
 @app.get("/video")
-async def video(
-    url: str = Query(...),
-    quality: str = Query("best")
+def stream_video(
+    url: str,
+    quality: str = "best"
 ):
-    video_file = os.path.join(DOWNLOAD_DIR, "video.mp4")
-    audio_file = os.path.join(DOWNLOAD_DIR, "audio.m4a")
-    output_file = os.path.join(DOWNLOAD_DIR, "output.mp4")
+    stream_id = str(uuid.uuid4())
+    out_file = f"{DOWNLOAD_DIR}/{stream_id}.mp4"
 
-    # CLEAN OLD FILES
-    for f in [video_file, audio_file, output_file]:
-        if os.path.exists(f):
-            os.remove(f)
+    # bestvideo+bestaudio MERGE (audio FIX)
+    format_selector = (
+        f"bestvideo[height<={quality.replace('p','')}]+bestaudio/best"
+        if quality != "best"
+        else "bestvideo+bestaudio/best"
+    )
 
-    # FORMAT SELECTOR
-    if quality == "best":
-        fmt = "bestvideo+bestaudio/best"
-    else:
-        q = int(quality.replace("p", ""))
-        fmt = f"bestvideo[height<={q}]+bestaudio/best"
-
-    # DOWNLOAD VIDEO
-    p1 = run([
-        YTDLP,
-        "-f", fmt,
+    cmd = [
+        "yt-dlp",
+        "--cookies", COOKIES_FILE,
+        "-f", format_selector,
         "--merge-output-format", "mp4",
-        "-o", output_file,
+        "-o", out_file,
         url
-    ])
+    ]
 
-    if p1.returncode != 0:
-        return JSONResponse({"error": p1.stderr}, status_code=500)
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        raise HTTPException(500, "Failed to stream video")
+
+    return FileResponse(out_file, media_type="video/mp4")
+
+
+# -------------------------
+# AUDIO ONLY
+# -------------------------
+@app.get("/audio")
+def audio_only(url: str):
+    audio_id = str(uuid.uuid4())
+    out_file = f"{DOWNLOAD_DIR}/{audio_id}.mp3"
+
+    cmd = [
+        "yt-dlp",
+        "--cookies", COOKIES_FILE,
+        "-f", "bestaudio",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "-o", out_file,
+        url
+    ]
+
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        raise HTTPException(500, "Audio extraction failed")
+
+    return FileResponse(out_file, media_type="audio/mpeg")
+
+
+# -------------------------
+# DOWNLOAD VIDEO (USER FILE)
+# -------------------------
+@app.get("/download")
+def download(
+    url: str,
+    quality: str = "best"
+):
+    file_id = str(uuid.uuid4())
+    out_file = f"{DOWNLOAD_DIR}/{file_id}.mp4"
+
+    format_selector = (
+        f"bestvideo[height<={quality.replace('p','')}]+bestaudio/best"
+        if quality != "best"
+        else "bestvideo+bestaudio/best"
+    )
+
+    cmd = [
+        "yt-dlp",
+        "--cookies", COOKIES_FILE,
+        "-f", format_selector,
+        "--merge-output-format", "mp4",
+        "-o", out_file,
+        url
+    ]
+
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        raise HTTPException(500, "Download failed")
 
     return FileResponse(
-        output_file,
-        filename=f"video_{quality}.mp4",
-        media_type="video/mp4"
-                             )
+        out_file,
+        filename="video.mp4",
+        media_type="application/octet-stream"
+    )
+
+
+# -------------------------
+# HEALTH CHECK
+# -------------------------
+@app.get("/")
+def root():
+    return {
+        "service": "Ytttt",
+        "status": "running"
+    }
